@@ -1,0 +1,128 @@
+from datetime import date, datetime
+import os
+import pandas as pd
+import numpy
+
+import psycopg2
+import psycopg2.extras as extras
+
+import pyinputplus
+import sys
+
+#1. Parsing data from CSV
+#a,creating the accesspath
+DIR_NAME = os.path.dirname(__file__)
+
+#b,reading in the files of the directory
+directory_content = os.listdir(DIR_NAME)
+
+#c,filtering out the csv-s only - putting them into an array
+csv_files = [x for x in directory_content if x.endswith('.csv')]
+
+#d, creating a dataframe from the csv-s
+csv_data_list = []
+for file in csv_files:
+    file_path = os.path.join(DIR_NAME,file)
+    csv_data_list = pd.read_csv(file_path,
+    sep=",",
+    low_memory=False,
+    parse_dates=True,
+    engine="c",  
+    chunksize=100000
+    )
+
+csv_df = pd.DataFrame(pd.concat(csv_data_list))
+
+#2. Cleaning the data
+#a, convert datetime
+#-create extra datetime
+datetime_list = []
+for row in csv_df["datetime"]:
+    if row[-5:] == "24:00":
+        row = row[:-5] + "00:00"
+    datetime_list.append(row)
+
+csv_df["Date_Time"] = datetime_list
+csv_df["Date_Time"] = csv_df["Date_Time"].apply(pd.to_datetime)
+
+#b, clean and convert duration
+clean_duration = []
+for idx, value in enumerate(csv_df["duration (seconds)"]):
+    try:
+        value= numpy.float32(value)
+    except:
+        value=value[:-1]
+        value=numpy.float32(value)
+    clean_duration.append(round(value,2))
+
+csv_df["Duration_Sec"] = clean_duration
+
+#c, convert date posted to datetime
+csv_df["DatePosted"] = csv_df["date posted"].astype(numpy.datetime64)
+
+#d, rename columns
+csv_df.rename(columns={"comments":"Comments",
+"duration (hours/min)":"Duration_Hour_Min","shape":"Shape","country":"Country",
+"state":"State","city":"City", "longitude ":"Longitude", "latitude":"Latitude"},inplace=True)    
+
+#creating new dataframe for clean and correct data
+clean_df = csv_df[["Date_Time","City","State","Country","Shape","Duration_Sec",
+"Duration_Hour_Min","Comments","DatePosted","Latitude","Longitude"]].copy(deep=True)
+
+#x, exporting the data into a csv file
+export_path = os.path.join(DIR_NAME,"final_sql.csv")
+clean_df.to_csv(path_or_buf=export_path, index=False)
+
+#3. PostgreSQL
+#a, connecting to the database
+user = pyinputplus.inputStr('Please enter your PostgreSQL username:\n')
+pw = pyinputplus.inputPassword('Please enter your PostgreSQL password:\n')
+
+param_dic = {
+    "host"      : "localhost",
+    "database"  : "postgres",
+    "user"      : user,
+    "password"  : pw
+}
+
+def connect(params_dic):
+    """ Connect to the PostgreSQL database server """
+    conn = None
+    try:
+        # connect to the PostgreSQL server
+        print('Connecting to the PostgreSQL database...')
+        conn = psycopg2.connect(**params_dic)
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(error)
+        sys.exit(1) 
+    print("Connection successful")
+    return conn
+
+conn = connect(param_dic)
+
+#inserting the dataframe to the specific table
+def execute_values(conn, df, table):
+    """
+    Using psycopg2.extras.execute_values() to insert the dataframe
+    """
+    # Create a list of tupples from the dataframe values
+    tuples = [tuple(x) for x in df.to_numpy()]
+    # Comma-separated dataframe columns
+    cols = ','.join(list(df.columns))
+    # SQL quert to execute
+    query  = "INSERT INTO %s(%s) VALUES %%s" % (table, cols)
+    cursor = conn.cursor()
+    try:
+        extras.execute_values(cursor, query, tuples)
+        conn.commit()
+    except (Exception, psycopg2.DatabaseError) as error:
+        print("Error: %s" % error)
+        conn.rollback()
+        cursor.close()
+        return 1
+    print("Insertion were successful!")
+    cursor.close()
+
+table = "sql_final"
+
+execute_values(conn=conn,df=clean_df,table=table)
